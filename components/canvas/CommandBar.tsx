@@ -4,43 +4,197 @@ import { useState, useRef, useEffect } from 'react'
 import ReactMarkdown from 'react-markdown'
 import { CADCommand } from '@/lib/cad/commands'
 import { SiteContext } from './VizinhoPanel'
+import { CanvasState } from '@/lib/cad/serializeCanvas'
+import type { AgentEvent } from '@/app/api/ai/command/route'
 
-interface Props {
-  onCommands: (commands: CADCommand[]) => void
-  siteContext?: SiteContext | null
+// ── Agent run types ─────────────────────────────────────────────────────────
+interface AgentStep {
+  id: string
+  type: 'thinking' | 'tool_call' | 'draw' | 'error'
+  name?: string
+  callId?: string
+  text?: string
+  args?: Record<string, unknown>
+  result?: unknown
+  isError?: boolean
+  label?: string   // for draw steps
 }
 
-const MODELS = [
-  { id: 'auto',                                    label: 'Auto',            badge: 'free' },
-  { id: 'google/gemini-3.1-flash-lite-preview',    label: 'Gemini Flash',    badge: 'free' },
-  { id: 'anthropic/claude-3.5-sonnet',             label: 'Claude Sonnet',   badge: '' },
-  { id: 'anthropic/claude-3.7-sonnet',             label: 'Claude 3.7',      badge: 'best' },
-  { id: 'openai/gpt-4o',                           label: 'GPT-4o',          badge: '' },
-  { id: 'openai/gpt-4o-mini',                      label: 'GPT-4o Mini',     badge: '' },
-  { id: 'google/gemini-2.0-flash-001',             label: 'Gemini 2.0 Flash',badge: '' },
-]
+interface AgentRun {
+  steps: AgentStep[]
+  done: boolean
+  reply: string
+  drawCount: number
+  collapsed: boolean
+}
 
-// auto resolves to the free model
-const AUTO_MODEL = 'google/gemini-3.1-flash-lite-preview'
-
-type MessageRole = 'user' | 'assistant' | 'error'
+// ── Message types ───────────────────────────────────────────────────────────
+type MessageRole = 'user' | 'assistant' | 'error' | 'agent_run'
 interface Message {
   id: string
   role: MessageRole
   text: string
-  command?: CADCommand
-  commands?: CADCommand[]  // full list for history context
+  agentRun?: AgentRun
+  commands?: CADCommand[]
 }
 
-const EXAMPLES = [
-  'Draw a 4×3m bedroom',
-  'Add a 90cm door on the north wall',
-  'Add a 120cm window',
-  'Draw a wall from 0,0 to 400,0',
-  'Label this room "Living Room"',
+interface Props {
+  onCommands: (commands: CADCommand[]) => void
+  onStreamCommand?: (cmd: Record<string, unknown>) => void
+  onStreamDone?: () => void
+  siteContext?: SiteContext | null
+  getCanvasState?: () => CanvasState | null
+  getCanvasImage?: () => Promise<string | null>
+}
+
+const MODELS = [
+  { id: 'auto',                                    label: 'Auto',             badge: 'free', vision: true,  tools: true  },
+  { id: 'openrouter/hunter-alpha',                 label: 'Hunter Alpha',     badge: 'free', vision: true,  tools: true  },
+  { id: 'google/gemini-2.0-flash-001',             label: 'Gemini 2.0 Flash', badge: '',     vision: true,  tools: true  },
+  { id: 'google/gemini-2.5-pro-preview',           label: 'Gemini 2.5 Pro',   badge: '',     vision: true,  tools: true  },
+  { id: 'anthropic/claude-sonnet-4.6',             label: 'Claude Sonnet',    badge: '',     vision: true,  tools: true  },
+  { id: 'anthropic/claude-3.7-sonnet',             label: 'Claude 3.7',       badge: 'best', vision: true,  tools: true  },
+  { id: 'openai/gpt-4o',                           label: 'GPT-4o',           badge: '',     vision: true,  tools: true  },
+  { id: 'openai/gpt-4o-mini',                      label: 'GPT-4o Mini',      badge: '',     vision: false, tools: false },
 ]
 
-export default function CommandBar({ onCommands, siteContext }: Props) {
+const AUTO_MODEL_ID = 'openrouter/hunter-alpha'
+
+const EXAMPLES = [
+  'Crie uma casa de praia com 3 quartos',
+  'Adicione uma porta de 90cm na parede norte',
+  'Adicione uma janela de 120cm',
+  'Desenhe uma sala integrada com cozinha',
+  'Comece do zero',
+]
+
+// ── Agent Run View ──────────────────────────────────────────────────────────
+function AgentRunView({ run, onToggle }: { run: AgentRun; onToggle: () => void }) {
+  const STEP_ICON: Record<string, string> = {
+    thinking: '💭', tool_call: '⚙️', draw: '✏️', error: '⚠️',
+  }
+
+  // Natural language descriptions for tool calls
+  const toolLabel = (name: string, args?: Record<string, unknown>): string => {
+    switch (name) {
+      case 'get_terrain_limits':   return 'Analisando os recuos e área construível…'
+      case 'compute_position': {
+        const rel = String(args?.relation ?? '').replace('adjacent_', '')
+        const ref = (args?.referenceRoom as Record<string,unknown>)
+        const refLabel = ref?.label ? ` de ${ref.label}` : ''
+        return `Calculando posição ${rel}${refLabel}…`
+      }
+      case 'draw_room': {
+        const lbl = String(args?.label ?? '')
+        const w = args?.width ? `${args.width}×${args.height}cm` : ''
+        return `Desenhando ${lbl}${w ? ` (${w})` : ''}…`
+      }
+      case 'place_door':           return `Colocando porta em [${(args?.position as number[])?.join(', ')}]…`
+      case 'place_window':         return `Colocando janela em [${(args?.position as number[])?.join(', ')}]…`
+      case 'wall_center':          return `Localizando parede ${String(args?.wall ?? '')} de ${String((args?.room as Record<string,unknown>)?.label ?? '')}…`
+      case 'validate_layout':      return 'Verificando normas técnicas (NBR)…'
+      case 'delete_element':       return `Removendo "${String(args?.label ?? '')}"…`
+      case 'clear_canvas':         return 'Limpando o canvas…'
+      case 'consultar_normas':     return `Consultando ${String(args?.norma ?? '')}…`
+      case 'add_annotation':       return `Adicionando anotação "${String(args?.text ?? '').slice(0, 30)}"…`
+      default:                     return name
+    }
+  }
+
+  const DRAW_TOOL_LABELS: Record<string, string> = {
+    draw_room: 'room', place_door: 'door', place_window: 'window',
+    add_annotation: 'note', delete_element: 'delete', clear_canvas: 'clear',
+  }
+
+  return (
+    <div style={{
+      width: '100%', background: '#f7f7fc', borderRadius: 10,
+      border: '1px solid #e8e8f0', overflow: 'hidden',
+    }}>
+      {/* Header */}
+      <button
+        onClick={onToggle}
+        style={{
+          width: '100%', display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+          background: 'none', border: 'none', padding: '8px 12px', cursor: 'pointer',
+          fontSize: 12, color: '#555',
+        }}
+      >
+        <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+          <span style={{ fontSize: 13 }}>✦</span>
+          {run.done
+            ? run.drawCount > 0
+              ? `Desenhou ${run.drawCount} elemento${run.drawCount > 1 ? 's' : ''}`
+              : (run.reply ? run.reply.slice(0, 60) : 'Concluído')
+            : <span style={{ opacity: 0.6 }}>processando…</span>
+          }
+        </span>
+        <span style={{ fontSize: 10, opacity: 0.5 }}>{run.collapsed ? '▸' : '▾'}</span>
+      </button>
+
+      {/* Steps */}
+      {!run.collapsed && (
+        <div style={{ padding: '0 12px 10px', display: 'flex', flexDirection: 'column', gap: 4 }}>
+          {run.steps.map(step => (
+            <div key={step.id} style={{
+              display: 'flex', alignItems: 'flex-start', gap: 6, fontSize: 11, color: '#666',
+            }}>
+              <span style={{ flexShrink: 0, marginTop: 1 }}>{STEP_ICON[step.type] ?? '·'}</span>
+              <span>
+                {step.type === 'thinking' && (
+                  <span style={{ opacity: 0.75, display: '-webkit-box', WebkitLineClamp: 3, WebkitBoxOrient: 'vertical', overflow: 'hidden' }}>
+                    {step.text ?? 'Pensando…'}
+                  </span>
+                )}
+                {step.type === 'tool_call' && (
+                  <span style={{ color: step.isError ? '#e53e3e' : '#444' }}>
+                    {step.isError && step.name && ['draw_room','place_door','place_window'].includes(step.name)
+                      ? `✗ ${toolLabel(step.name, step.args as Record<string, unknown>).replace('…', '')} — fora dos limites ou sobreposição`
+                      : toolLabel(step.name ?? '', step.args as Record<string, unknown>)
+                    }
+                  </span>
+                )}
+                {step.type === 'draw' && (() => {
+                  const cmd = step.args as Record<string,unknown>
+                  const action = cmd?.action as string
+                  if (action === 'draw_room') return <span style={{ color: '#2d6a4f' }}>✓ {String(cmd.label ?? '')} desenhado</span>
+                  if (action === 'place_door') return <span style={{ color: '#2d6a4f' }}>✓ Porta colocada</span>
+                  if (action === 'place_window') return <span style={{ color: '#2d6a4f' }}>✓ Janela colocada</span>
+                  if (action === 'delete_element') return <span style={{ color: '#888' }}>✕ {String(cmd.label ?? '')} removido</span>
+                  if (action === 'clear_canvas') return <span style={{ color: '#888' }}>✕ Canvas limpo</span>
+                  return <span style={{ color: '#2d6a4f' }}>✓ {action}</span>
+                })()}
+                {step.type === 'error' && <span style={{ color: '#e53e3e' }}>{step.text}</span>}
+              </span>
+            </div>
+          ))}
+
+          {run.done && run.reply && (
+            <div style={{ marginTop: 6, paddingTop: 6, borderTop: '1px solid #e8e8f0', fontSize: 12, color: '#444', lineHeight: 1.5 }}>
+              <ReactMarkdown
+                components={{
+                  p: ({children}) => <p style={{ margin: '0 0 4px' }}>{children}</p>,
+                  strong: ({children}) => <strong style={{ fontWeight: 600 }}>{children}</strong>,
+                }}
+              >
+                {run.reply}
+              </ReactMarkdown>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Collapsed summary reply */}
+      {run.collapsed && run.done && run.reply && (
+        <div style={{ padding: '0 12px 8px', fontSize: 11, color: '#888', lineHeight: 1.4 }}>
+          {run.reply.slice(0, 80)}{run.reply.length > 80 ? '…' : ''}
+        </div>
+      )}
+    </div>
+  )
+}
+
+export default function CommandBar({ onCommands, onStreamCommand, onStreamDone, siteContext, getCanvasState, getCanvasImage }: Props) {
   const [value, setValue] = useState('')
   const [loading, setLoading] = useState(false)
   const [messages, setMessages] = useState<Message[]>([])
@@ -67,66 +221,146 @@ export default function CommandBar({ onCommands, siteContext }: Props) {
   }, [messages])
 
   const selectedModel = MODELS.find(m => m.id === model) ?? MODELS[0]
-  const resolvedModel = model === 'auto' ? AUTO_MODEL : model
+  const resolvedModel = model === 'auto' ? AUTO_MODEL_ID : model
+  const resolvedModelMeta = MODELS.find(m => m.id === resolvedModel) ?? MODELS[1]
 
   const handleSubmit = async (e?: React.FormEvent) => {
     e?.preventDefault()
     if (!value.trim() || loading) return
 
-    const userMsg: Message = { id: Date.now().toString(), role: 'user', text: value.trim() }
-    setMessages(prev => [...prev, userMsg])
     const prompt = value.trim()
+    const runId = Date.now().toString()
+    const userMsg: Message = { id: runId, role: 'user', text: prompt }
+
+    // Placeholder agent_run message — we'll update it as events arrive
+    const runMsgId = runId + '_run'
+    const initialRun: AgentRun = { steps: [], done: false, reply: '', drawCount: 0, collapsed: false }
+    setMessages(prev => [...prev, userMsg, { id: runMsgId, role: 'agent_run', text: '', agentRun: initialRun }])
     setValue('')
     setLoading(true)
 
+    const updateRun = (updater: (run: AgentRun) => AgentRun) => {
+      setMessages(prev => prev.map(m => m.id === runMsgId
+        ? { ...m, agentRun: updater(m.agentRun!) }
+        : m
+      ))
+    }
+
     try {
+      const canvasImage = resolvedModelMeta.vision
+        ? await getCanvasImage?.().catch(() => null) ?? null
+        : null
+
       const res = await fetch('/api/ai/command', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           prompt,
           model: resolvedModel,
+          supportsTools: resolvedModelMeta.tools,
           siteContext: siteContext ?? null,
-          // Send prior messages (exclude errors) so AI knows what's on canvas
+          canvasState: getCanvasState?.() ?? null,
+          canvasImage,
           history: [...messages, userMsg]
-            .filter(m => m.role !== 'error')
-            .map(m => ({
-              role: m.role,
-              text: m.text,
-              commands: m.commands,
-            })),
+            .filter(m => m.role !== 'error' && m.role !== 'agent_run')
+            .map(m => ({ role: m.role === 'agent_run' ? 'assistant' : m.role, text: m.text })),
         }),
       })
 
-      const data = await res.json()
-      if (!res.ok || data.error) throw new Error(data.error ?? 'AI request failed')
+      if (!res.ok || !res.body) {
+        const err = await res.json().catch(() => ({ error: 'Request failed' }))
+        throw new Error(err.error ?? 'AI request failed')
+      }
 
-      if (data.reply) {
-        // Conversational response — no canvas action
-        setMessages(prev => [...prev, {
-          id: Date.now().toString() + '_a',
-          role: 'assistant',
-          text: data.reply,
-        }])
-      } else {
-        const commands: CADCommand[] = data.commands
-        onCommands(commands)
-        const desc = commands.length === 1
-          ? describeCommand(commands[0])
-          : `Executei ${commands.length} operações`
-        setMessages(prev => [...prev, {
-          id: Date.now().toString() + '_a',
-          role: 'assistant',
-          text: desc,
-          command: commands[0],
-          commands,
-        }])
+      const reader = res.body.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+
+      while (true) {
+        const { done, value: chunk } = await reader.read()
+        if (done) break
+        buffer += decoder.decode(chunk, { stream: true })
+        const lines = buffer.split('\n')
+        buffer = lines.pop() ?? ''
+
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue
+          let event: AgentEvent
+          try { event = JSON.parse(line.slice(6)) } catch { continue }
+
+          switch (event.type) {
+            case 'thinking':
+              updateRun(run => ({
+                ...run,
+                steps: [...run.steps, { id: Date.now().toString(), type: 'thinking', text: event.text }],
+              }))
+              break
+
+            case 'tool_call':
+              updateRun(run => ({
+                ...run,
+                steps: [...run.steps, {
+                  id: event.callId,
+                  type: 'tool_call',
+                  name: event.name,
+                  callId: event.callId,
+                  args: event.args,
+                }],
+              }))
+              break
+
+            case 'tool_result':
+              // Annotate the matching tool_call step with its result
+              updateRun(run => ({
+                ...run,
+                steps: run.steps.map(s =>
+                  s.callId === event.callId
+                    ? { ...s, result: event.result, isError: event.isError }
+                    : s
+                ),
+              }))
+              break
+
+            case 'draw':
+              // Execute on canvas immediately
+              onStreamCommand?.(event.command)
+              updateRun(run => ({
+                ...run,
+                drawCount: run.drawCount + 1,
+                steps: [...run.steps, {
+                  id: Date.now().toString() + Math.random(),
+                  type: 'draw',
+                  label: (event.command.label as string) ?? (event.command.action as string),
+                  args: event.command,
+                }],
+              }))
+              break
+
+            case 'error':
+              updateRun(run => ({
+                ...run,
+                steps: [...run.steps, { id: Date.now().toString(), type: 'error', text: event.message }],
+              }))
+              break
+
+            case 'done':
+              onStreamDone?.()
+              updateRun(run => ({
+                ...run,
+                done: true,
+                reply: event.reply,
+                drawCount: event.drawCount,
+                collapsed: false,  // always stay open — user can collapse manually
+              }))
+              break
+          }
+        }
       }
     } catch (err) {
       setMessages(prev => [...prev, {
         id: Date.now().toString() + '_e',
         role: 'error',
-        text: err instanceof Error ? err.message : 'Could not process that command.',
+        text: err instanceof Error ? err.message : 'Erro ao processar.',
       }])
     } finally {
       setLoading(false)
@@ -266,51 +500,60 @@ export default function CommandBar({ onCommands, siteContext }: Props) {
             flexDirection: 'column',
             alignItems: msg.role === 'user' ? 'flex-end' : 'flex-start',
           }}>
-            <div style={{
-              maxWidth: '85%',
-              padding: '7px 10px',
-              borderRadius: msg.role === 'user' ? '12px 12px 2px 12px' : '12px 12px 12px 2px',
-              background: msg.role === 'user' ? '#1a1a2e'
-                : msg.role === 'error' ? '#fff0f0'
-                : '#f0f0f8',
-              color: msg.role === 'user' ? 'white'
-                : msg.role === 'error' ? '#c0392b'
-                : '#333',
-              fontSize: 13,
-              lineHeight: 1.5,
-            }}>
-              {msg.role === 'assistant' ? (
-                <ReactMarkdown
-                  components={{
-                    p:      ({children}) => <p style={{ margin: '0 0 6px', lineHeight: 1.5 }}>{children}</p>,
-                    ul:     ({children}) => <ul style={{ margin: '4px 0 6px', paddingLeft: 18 }}>{children}</ul>,
-                    ol:     ({children}) => <ol style={{ margin: '4px 0 6px', paddingLeft: 18 }}>{children}</ol>,
-                    li:     ({children}) => <li style={{ marginBottom: 2, lineHeight: 1.5 }}>{children}</li>,
-                    strong: ({children}) => <strong style={{ fontWeight: 600 }}>{children}</strong>,
-                    em:     ({children}) => <em>{children}</em>,
-                    h1:     ({children}) => <div style={{ fontWeight: 700, fontSize: 14, margin: '6px 0 4px' }}>{children}</div>,
-                    h2:     ({children}) => <div style={{ fontWeight: 700, fontSize: 13, margin: '6px 0 3px' }}>{children}</div>,
-                    h3:     ({children}) => <div style={{ fontWeight: 600, fontSize: 12, margin: '4px 0 2px', color: '#555' }}>{children}</div>,
-                    code:   ({children}) => <code style={{ fontFamily: 'monospace', fontSize: 11, background: '#e8e8f0', padding: '1px 4px', borderRadius: 3 }}>{children}</code>,
-                    hr:     () => <hr style={{ border: 'none', borderTop: '1px solid #e0e0e0', margin: '8px 0' }} />,
-                  }}
-                >
-                  {msg.text}
-                </ReactMarkdown>
-              ) : (
-                msg.text
-              )}
-            </div>
+            {msg.role === 'agent_run' ? (
+              <AgentRunView run={msg.agentRun!} onToggle={() =>
+                setMessages(prev => prev.map(m => m.id === msg.id
+                  ? { ...m, agentRun: { ...m.agentRun!, collapsed: !m.agentRun!.collapsed } }
+                  : m
+                ))
+              } />
+            ) : (
+              <div style={{
+                maxWidth: '85%',
+                padding: '7px 10px',
+                borderRadius: msg.role === 'user' ? '12px 12px 2px 12px' : '12px 12px 12px 2px',
+                background: msg.role === 'user' ? '#1a1a2e'
+                  : msg.role === 'error' ? '#fff0f0'
+                  : '#f0f0f8',
+                color: msg.role === 'user' ? 'white'
+                  : msg.role === 'error' ? '#c0392b'
+                  : '#333',
+                fontSize: 13,
+                lineHeight: 1.5,
+              }}>
+                {msg.role === 'assistant' ? (
+                  <ReactMarkdown
+                    components={{
+                      p:      ({children}) => <p style={{ margin: '0 0 6px', lineHeight: 1.5 }}>{children}</p>,
+                      ul:     ({children}) => <ul style={{ margin: '4px 0 6px', paddingLeft: 18 }}>{children}</ul>,
+                      ol:     ({children}) => <ol style={{ margin: '4px 0 6px', paddingLeft: 18 }}>{children}</ol>,
+                      li:     ({children}) => <li style={{ marginBottom: 2, lineHeight: 1.5 }}>{children}</li>,
+                      strong: ({children}) => <strong style={{ fontWeight: 600 }}>{children}</strong>,
+                      em:     ({children}) => <em>{children}</em>,
+                      h1:     ({children}) => <div style={{ fontWeight: 700, fontSize: 14, margin: '6px 0 4px' }}>{children}</div>,
+                      h2:     ({children}) => <div style={{ fontWeight: 700, fontSize: 13, margin: '6px 0 3px' }}>{children}</div>,
+                      h3:     ({children}) => <div style={{ fontWeight: 600, fontSize: 12, margin: '4px 0 2px', color: '#555' }}>{children}</div>,
+                      code:   ({children}) => <code style={{ fontFamily: 'monospace', fontSize: 11, background: '#e8e8f0', padding: '1px 4px', borderRadius: 3 }}>{children}</code>,
+                      hr:     () => <hr style={{ border: 'none', borderTop: '1px solid #e0e0e0', margin: '8px 0' }} />,
+                    }}
+                  >
+                    {msg.text}
+                  </ReactMarkdown>
+                ) : (
+                  msg.text
+                )}
+              </div>
+            )}
           </div>
         ))}
 
-        {loading && (
+        {loading && !messages.some(m => m.role === 'agent_run' && !m.agentRun?.done) && (
           <div style={{ display: 'flex', alignItems: 'flex-start' }}>
             <div style={{
               padding: '7px 12px', borderRadius: '12px 12px 12px 2px',
               background: '#f0f0f8', fontSize: 12, color: '#888',
             }}>
-              <span style={{ animation: 'pulse 1.5s infinite' }}>thinking…</span>
+              ✦ <span style={{ opacity: 0.7 }}>processando…</span>
             </div>
           </div>
         )}
@@ -400,9 +643,10 @@ function CopyLogsButton({ messages }: { messages: Message[] }) {
     if (messages.length === 0) return
     const lines = messages.map(m => {
       const role = m.role === 'user' ? '→ User' : m.role === 'error' ? '✗ Error' : '← AI'
-      const body = m.command
-        ? `${m.text}\n${JSON.stringify(m.command, null, 2)}`
-        : m.text
+      let body = m.text
+      if (m.commands && m.commands.length > 0) {
+        body += '\n' + JSON.stringify(m.commands.length === 1 ? m.commands[0] : m.commands, null, 2)
+      }
       return `${role}: ${body}`
     })
     navigator.clipboard.writeText(lines.join('\n\n')).then(() => {

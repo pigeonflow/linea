@@ -7,6 +7,7 @@ import SunPanel from './SunPanel'
 import VizinhoPanel, { SiteContext } from './VizinhoPanel'
 import CompassRose from './CompassRose'
 import CommandBar from './CommandBar'
+import { serializeCanvas, captureCanvasImage, SunState } from '@/lib/cad/serializeCanvas'
 import { CADCommand } from '@/lib/cad/commands'
 import { WallShapeUtil, WALL_TYPE } from './shapes/WallShape'
 import { WallTool } from './shapes/WallTool'
@@ -34,8 +35,11 @@ export default function LineaCanvas() {
   const [northAngle, setNorthAngle] = useState(0)
   const [siteContext, setSiteContext] = useState<SiteContext | null>(null)
   const [lotOrigin, setLotOrigin] = useState<{ x: number; y: number } | null>(null)
+  const [sunState, setSunState] = useState<SunState | null>(null)
   const lastRoom = useRef<RoomRef | null>(null)
   const lastVpOffset = useRef<{ x: number; y: number }>({ x: 0, y: 0 })
+  // Accumulate rooms drawn via streaming so we can do topology after a batch
+  const streamingRooms = useRef<Extract<CADCommand, { action: 'draw_room' }>[]>([])
 
   const handleMount = useCallback((ed: Editor) => setEditor(ed), [])
 
@@ -80,14 +84,28 @@ export default function LineaCanvas() {
       case 'place_door': {
         const px = vpOffset.x + (command.position?.[0] ?? 0)
         const py = vpOffset.y + (command.position?.[1] ?? 0)
+        const doorWidth = command.width ?? 90
+        const rotation = command.rotation ?? 0
+        const isVertical = Math.abs(rotation % 180) === 90
+        // Door shape bounding box: doorWidth × (doorWidth + 10)
+        // Opening is at y=0 (top edge), centered at x=doorWidth/2
+        // For horizontal (rotation=0): place so opening center lands at (px, py)
+        //   → shape x = px - doorWidth/2, y = py
+        // For vertical (rotation=90°): tldraw rotates around shape center
+        //   After π/2 rotation, opening center maps to (x + doorWidth + 5, y + (doorWidth+10)/2)
+        //   → x = px - doorWidth - 5, y = py - (doorWidth + 10) / 2
+        const sx = isVertical ? px - doorWidth - 5       : px - doorWidth / 2
+        const sy = isVertical ? py - (doorWidth + 10) / 2 : py
         editor.createShape({
-          id: createShapeId(), type: DOOR_TYPE, x: px, y: py,
+          id: createShapeId(), type: DOOR_TYPE,
+          x: sx, y: sy,
+          rotation: isVertical ? Math.PI / 2 : 0,
           props: {
-            width: command.width,
+            width: doorWidth,
             swing: command.swingDirection === 'double' ? 'double'
               : command.swingDirection === 'sliding' ? 'sliding'
               : command.swingDirection === 'right' ? 'right' : 'left',
-            rotation: command.rotation,
+            rotation,
           },
         })
         break
@@ -96,9 +114,15 @@ export default function LineaCanvas() {
       case 'place_window': {
         const px = vpOffset.x + (command.position?.[0] ?? 0)
         const py = vpOffset.y + (command.position?.[1] ?? 0)
+        const rotation = command.rotation ?? 0
+        const isVertical = Math.abs(rotation % 180) === 90
+        const width = command.width ?? 120
+        const sillDepth = 20
         editor.createShape({
-          id: createShapeId(), type: WINDOW_TYPE, x: px, y: py,
-          props: { width: command.width, sillDepth: 20 },
+          id: createShapeId(), type: WINDOW_TYPE,
+          x: isVertical ? px - sillDepth / 2 : px - width / 2,
+          y: isVertical ? py - width / 2    : py - sillDepth / 2,
+          props: { width, sillDepth, rotation },
         })
         break
       }
@@ -117,11 +141,60 @@ export default function LineaCanvas() {
         editor.deleteShapes(editor.getSelectedShapeIds())
         break
 
+      case 'delete_element': {
+        // Find shape(s) matching the label — geo shapes have a label prop
+        const shapes = editor.getCurrentPageShapes()
+        const toDelete = shapes.filter(s => {
+          const p = s.props as unknown as Record<string, unknown>
+          const lbl = (p.label as string ?? '').toLowerCase()
+          return lbl === (command.label ?? '').toLowerCase()
+        })
+        if (toDelete.length > 0) {
+          editor.deleteShapes(toDelete.map(s => s.id))
+        }
+        break
+      }
+
+      case 'clear_canvas': {
+        const allIds = [...editor.getCurrentPageShapeIds()]
+        if (allIds.length > 0) editor.deleteShapes(allIds)
+        break
+      }
+
       case 'select_all':
         editor.selectAll()
         break
     }
   }, [editor])
+
+  // Called per draw event from SSE stream — live canvas update
+  const executeStream = useCallback((rawCommand: Record<string, unknown>) => {
+    if (!editor) return
+    const parse = CADCommand.safeParse(rawCommand)
+    if (!parse.success) return
+    const command = parse.data
+    const wallIds: TLShapeId[] = []
+
+    if (command.action === 'draw_room') {
+      if (streamingRooms.current.length === 0) {
+        const vp = getVpCenter(editor)
+        const vpOffset = { x: vp.x - (command.origin?.[0] ?? 0) - command.width / 2, y: vp.y - (command.origin?.[1] ?? 0) - command.height / 2 }
+        lastVpOffset.current = vpOffset
+        setLotOrigin(vpOffset)
+      }
+      streamingRooms.current.push(command)
+      buildWallTopology(editor, streamingRooms.current.map(r => ({
+        ox: r.origin?.[0] ?? 0, oy: r.origin?.[1] ?? 0,
+        width: r.width, height: r.height, thickness: r.wallThickness ?? 20,
+      })), lastVpOffset.current)
+      executeOne(command, lastVpOffset.current, wallIds)
+    } else {
+      if (command.action === 'clear_canvas') streamingRooms.current = []
+      executeOne(command, lastVpOffset.current, wallIds)
+    }
+  }, [editor, executeOne])
+
+  const finalizeStream = useCallback(() => { streamingRooms.current = [] }, [])
 
   const executeCommands = useCallback((commands: CADCommand[]) => {
     if (!editor) return
@@ -176,11 +249,35 @@ export default function LineaCanvas() {
         <>
           <Toolbar activeTool={activeTool} onSelect={handleToolSelect} />
           <LayersPanel editor={editor} />
-          <SunPanel northAngle={northAngle} onNorthAngle={setNorthAngle} />
+          <SunPanel northAngle={northAngle} onNorthAngle={setNorthAngle} onSunState={setSunState} />
           <VizinhoPanel editor={editor} onSiteContext={setSiteContext} canvasOrigin={lotOrigin} />
           <CompassRose northAngle={northAngle} />
           <ExportButton editor={editor} />
-          <CommandBar onCommands={executeCommands} siteContext={siteContext} />
+          <CommandBar
+            onCommands={executeCommands}
+            onStreamCommand={executeStream}
+            onStreamDone={finalizeStream}
+            siteContext={siteContext}
+            getCanvasState={() => editor ? serializeCanvas(editor, {
+              vpOffset: lastVpOffset.current,
+              sun: sunState ?? undefined,
+              site: siteContext ? {
+                city: siteContext.city,
+                lotWidthM: siteContext.lot.width / 100,
+                lotHeightM: siteContext.lot.height / 100,
+                setbacks: {
+                  frontalM: siteContext.rules.frontal / 100,
+                  lateralM: siteContext.rules.lateral / 100,
+                  fundosM: siteContext.rules.fundos / 100,
+                },
+                buildableAreaSqM: Math.round(
+                  ((siteContext.lot.width - siteContext.rules.lateral * 2) / 100) *
+                  ((siteContext.lot.height - siteContext.rules.frontal - siteContext.rules.fundos) / 100)
+                ),
+              } : undefined,
+            }) : null}
+            getCanvasImage={() => editor ? captureCanvasImage(editor) : Promise.resolve(null)}
+          />
         </>
       )}
     </div>

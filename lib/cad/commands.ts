@@ -59,6 +59,15 @@ export const SelectAllCommand = z.object({
   action: z.literal('select_all'),
 })
 
+export const DeleteElementCommand = z.object({
+  action: z.literal('delete_element'),
+  label: z.string(),
+})
+
+export const ClearCanvasCommand = z.object({
+  action: z.literal('clear_canvas'),
+})
+
 // ─── Union ─────────────────────────────────────────────────────────────────
 
 export const CADCommand = z.discriminatedUnion('action', [
@@ -70,6 +79,8 @@ export const CADCommand = z.discriminatedUnion('action', [
   AddDimensionCommand,
   DeleteSelectionCommand,
   SelectAllCommand,
+  DeleteElementCommand,
+  ClearCanvasCommand,
 ])
 
 export type CADCommand = z.infer<typeof CADCommand>

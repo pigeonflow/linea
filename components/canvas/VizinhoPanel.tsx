@@ -1,6 +1,6 @@
 'use client'
 
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { Editor, createShapeId } from 'tldraw'
 
 interface SetbackRule {
@@ -42,6 +42,12 @@ export default function VizinhoPanel({ editor, onSiteContext, canvasOrigin }: Pr
   const [zoneIds, setZoneIds] = useState<string[]>([])
 
   const rules = CITY_RULES[city] ?? CITY_RULES['default']
+
+  // Fire on mount so LineaCanvas always has site context even before user interacts
+  useEffect(() => {
+    notify(city, lot)
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   // Notify parent whenever city or lot changes
   const notify = (newCity: string, newLot: LotDimensions) => {

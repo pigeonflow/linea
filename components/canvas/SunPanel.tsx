@@ -3,18 +3,19 @@
 import { useState, useEffect, useRef } from 'react'
 import { getSunPosition, getSunPath, getSunTimes, KEY_DATES, DEFAULT_LOCATION, SunPathPoint } from '@/lib/sun/sunCalc'
 
+import { SunState } from '@/lib/cad/serializeCanvas'
+
 interface Location { lat: number; lng: number; label: string }
 
 interface Props {
-  /** Called when north angle changes so canvas can rotate the compass rose */
   onNorthAngle?: (deg: number) => void
-  /** Canvas north offset in degrees (0 = canvas up is true north) */
   northAngle: number
+  onSunState?: (state: SunState) => void
 }
 
 const CARD_LABELS = ['N', 'NE', 'L', 'SE', 'S', 'SO', 'O', 'NO']
 
-export default function SunPanel({ northAngle, onNorthAngle }: Props) {
+export default function SunPanel({ northAngle, onNorthAngle, onSunState }: Props) {
   const [open, setOpen] = useState(false)
   const [location, setLocation] = useState<Location>(DEFAULT_LOCATION)
   const [locationInput, setLocationInput] = useState(DEFAULT_LOCATION.label)
@@ -40,6 +41,21 @@ export default function SunPanel({ northAngle, onNorthAngle }: Props) {
   useEffect(() => {
     setPath(getSunPath(location.lat, location.lng, currentDate))
   }, [location, currentDate])
+
+  // Emit sun state whenever relevant values change
+  useEffect(() => {
+    if (!onSunState) return
+    const pad = (n: number) => String(n).padStart(2, '0')
+    onSunState({
+      city: location.label,
+      azimuthDeg: Math.round(sunPos.azimuth),
+      altitudeDeg: Math.round(sunPos.altitude),
+      time: `${pad(timeH)}:00`,
+      date: sunDate.toISOString().slice(0, 10),
+      northAngleDeg: northAngle,
+    })
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [location, sunPos.azimuth, sunPos.altitude, timeH, northAngle])
 
   // Draw sun diagram
   useEffect(() => {
